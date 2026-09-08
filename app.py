@@ -1,91 +1,121 @@
-import streamlit as st
-import yfinance as yf
-import pandas as pd
-import pandas_ta as ta
-import plotly.graph_objects as go
+def generate_intraday_signals(
+    df: pd.DataFrame,
+    fast_ema: int = 9,
+    slow_ema: int = 21,
+    atr_period: int = 14,
+    rvol_window: int = 20,
+    adx_period: int = 14,
+    adx_threshold: float = 25.0
+) -> pd.DataFrame:
+    """Computes dynamic multi-factor entry thresholds for intraday directional debit spreads."""
+    df = df.copy()
 
-# ---------------------------------------------------------
-# Page Configuration
-# ---------------------------------------------------------
-st.set_page_config(page_title="TTM Squeeze Scanner", page_icon="💥", layout="wide")
-st.title("💥 Mega-Cap TTM Squeeze Scanner")
-st.caption("Detects explosive volatility breakouts when Bollinger Bands narrow inside Keltner Channels.")
+    # 1. EMAs and Normalized Delta
+    df["ema_fast"] = df["close"].ewm(span=fast_ema, adjust=False).mean()
+    df["ema_slow"] = df["close"].ewm(span=slow_ema, adjust=False).mean()
 
-# ---------------------------------------------------------
-# Data Engine
-# ---------------------------------------------------------
-# Defaulting to high-beta/mega-cap tech and your core watchlist
-DEFAULT_TICKERS = ["SPY", "QQQ", "GOOGL", "NVDA", "AMZN"]
+    # 2. ATR Calculation
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - df["close"].shift(1)).abs()
+    tr3 = (df["low"] - df["close"].shift(1)).abs()
+    df["tr"] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr"] = df["tr"].rolling(window=atr_period).mean()
 
-@st.cache_data(ttl=300) # 5-minute refresh to avoid IP bans
-def fetch_and_calculate_squeeze(ticker: str):
-    df = yf.download(ticker, period="10d", interval="5m", progress=False)
+    # Normalize EMA separation by ATR
+    df["ema_spread_norm"] = (df["ema_fast"] - df["ema_slow"]) / df["atr"]
+
+    # 3. Normalized Distance from VWAP
+    df["vwap_dist_norm"] = (df["close"] - df["vwap"]) / df["atr"]
+
+    # 4. Volume Validation (RVOL)
+    df["vol_ma"] = df["volume"].rolling(window=rvol_window).mean()
+    df["rvol"] = df["volume"] / df["vol_ma"]
+
+    # 5. ADX and DMI Calculation
+    adx_df = ta.adx(df["high"], df["low"], df["close"], length=adx_period)
     
-    if df.empty:
-        return None
-        
-    # Flatten multi-index columns if yfinance returns them
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df.columns = [c.lower() for c in df.columns]
+    adx_col = f"ADX_{adx_period}"
+    dmp_col = f"DMP_{adx_period}"
+    dmn_col = f"DMN_{adx_period}"
+    
+    if adx_df is not None:
+        df = pd.concat([df, adx_df], axis=1)
+    else:
+        # Fallback if calculation fails on limited data
+        df[adx_col], df[dmp_col], df[dmn_col] = 0.0, 0.0, 0.0
 
-    # Calculate TTM Squeeze using pandas_ta
-    # Returns Squeeze Status (1=On, 0=Off) and Momentum Histogram
+    # 6. TTM Squeeze Calculation
     squeeze_df = df.ta.squeeze(lazybear=False, detailed=True)
     
     if squeeze_df is not None:
         df = pd.concat([df, squeeze_df], axis=1)
         
-        # Standard pandas_ta column names for Squeeze
+        # Dynamically extract standard pandas_ta squeeze columns
         sqz_on_col = [c for c in df.columns if "SQZ_ON" in c][0]
         sqz_off_col = [c for c in df.columns if "SQZ_OFF" in c][0]
-        hist_col = [c for c in df.columns if "SQZ_INC" in c or "SQZ_DEC" in c or "SQZ20" in c][0]
         
-        # Strategy Logic: Find exactly when it transitions from ON to OFF
+        # Safely extract the histogram column (ignoring the ON/OFF/NO boolean columns)
+        hist_col = [c for c in df.columns if "SQZ" in c and "ON" not in c and "OFF" not in c and "NO" not in c][0]
+        
+        # Trigger 1: The Squeeze Firing (Dots transition Red -> Green)
         df["squeeze_firing"] = (df[sqz_off_col] == 1) & (df[sqz_on_col].shift(1) == 1)
         
-        # Determine Direction based on momentum histogram
-        df["signal"] = 0
-        df.loc[df["squeeze_firing"] & (df[hist_col] > 0), "signal"] = 1  # Call Spread
-        df.loc[df["squeeze_firing"] & (df[hist_col] < 0), "signal"] = -1 # Put Spread
-        
+        # Trigger 2: Momentum Histogram Direction and Acceleration
+        df["hist_light_blue"] = (df[hist_col] > 0) & (df[hist_col] > df[hist_col].shift(1))
+        df["hist_red"] = (df[hist_col] < 0) & (df[hist_col] < df[hist_col].shift(1))
+    else:
+        # Fallbacks if squeeze fails to calculate
+        df["squeeze_firing"] = False
+        df["hist_light_blue"] = False
+        df["hist_red"] = False
+
+    # 7. Session Phase Filtering
+    time = df.index.time
+    t_start_am = pd.to_datetime("09:50:00").time()
+    t_end_am = pd.to_datetime("11:30:00").time()
+    t_start_pm = pd.to_datetime("13:45:00").time()
+    t_end_pm = pd.to_datetime("15:15:00").time()
+
+    session_active = ((time >= t_start_am) & (time <= t_end_am)) | (
+        (time >= t_start_pm) & (time <= t_end_pm)
+    )
+
+    # 8. Unified Signal Logic (Structure + Trend + Volatility Breakout)
+    call_spread_trigger = (
+        session_active
+        & (df["ema_spread_norm"] > 0.15)
+        & (df["vwap_dist_norm"] >= 0.20)
+        & (df["vwap_dist_norm"] <= 1.10)
+        & (df["rvol"] >= 1.30)
+        & (df["close"] > df["open"])
+        & (df[adx_col] >= adx_threshold)
+        & (df[dmp_col] > df[dmn_col])
+        & df["squeeze_firing"]
+        & df["hist_light_blue"]
+    )
+
+    put_spread_trigger = (
+        session_active
+        & (df["ema_spread_norm"] < -0.15)
+        & (df["vwap_dist_norm"] <= -0.20)
+        & (df["vwap_dist_norm"] >= -1.10)
+        & (df["rvol"] >= 1.30)
+        & (df["close"] < df["open"])
+        & (df[adx_col] >= adx_threshold)
+        & (df[dmn_col] > df[dmp_col])
+        & df["squeeze_firing"]
+        & df["hist_red"]
+    )
+
+    df["signal"] = 0
+    df.loc[call_spread_trigger, "signal"] = 1
+    df.loc[put_spread_trigger, "signal"] = -1
+
+    # Filter out consecutive duplicate signals (take initial impulse only)
+    df["entry_signal"] = np.where(
+        (df["signal"] != 0) & (df["signal"] != df["signal"].shift(1)),
+        df["signal"],
+        0,
+    )
+
     return df
-
-# ---------------------------------------------------------
-# UI & Display
-# ---------------------------------------------------------
-if st.button("🔄 Scan Market"):
-    st.cache_data.clear()
-
-cols = st.columns(len(DEFAULT_TICKERS))
-
-for col, ticker in zip(cols, DEFAULT_TICKERS):
-    df = fetch_and_calculate_squeeze(ticker)
-    
-    with col:
-        st.subheader(ticker)
-        if df is None:
-            st.error("Data error")
-            continue
-            
-        latest = df.iloc[-1]
-        current_price = latest["close"]
-        signal = latest.get("signal", 0)
-        
-        st.metric("Last Price", f"${current_price:.2f}")
-        
-        if signal == 1:
-             st.success("🟢 SQUEEZE FIRED: CALL SPREAD")
-             st.write("Momentum is expanding upward.")
-        elif signal == -1:
-             st.error("🔴 SQUEEZE FIRED: PUT SPREAD")
-             st.write("Momentum is expanding downward.")
-        else:
-             # Check if it's currently compressing
-             sqz_on_col = [c for c in df.columns if "SQZ_ON" in c][0]
-             if latest[sqz_on_col] == 1:
-                 st.warning("🟡 SQUEEZE COMPRESSING")
-                 st.write("Wait for the breakout.")
-             else:
-                 st.info("⚪ NO ACTIVE SQUEEZE")
-                 st.write("Volatility is normal.")
